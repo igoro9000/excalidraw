@@ -6,6 +6,7 @@ import {
   reconcileElements,
   useEditorInterface,
 } from "@excalidraw/excalidraw";
+import { clearAppStateForLocalStorage } from "@excalidraw/excalidraw/appState";
 import { trackEvent } from "@excalidraw/excalidraw/analytics";
 import { getDefaultAppState } from "@excalidraw/excalidraw/appState";
 import {
@@ -89,6 +90,7 @@ import {
 import {
   FIREBASE_STORAGE_PREFIXES,
   isExcalidrawPlusSignedUser,
+  SAVE_TO_LOCAL_STORAGE_TIMEOUT,
   STORAGE_KEYS,
   SYNC_BROWSER_TABS_TIMEOUT,
 } from "./app_constants";
@@ -125,7 +127,10 @@ import {
   LibraryLocalStorageMigrationAdapter,
   LocalData,
   localStorageQuotaExceededAtom,
+  ScenesIndexedDBAdapter,
+  type SavedScene,
 } from "./data/LocalData";
+import { LocalFilesDialog } from "./components/LocalFilesDialog";
 import { isBrowserStorageStateNewer } from "./data/tabSync";
 import { ShareDialog, shareDialogStateAtom } from "./share/ShareDialog";
 import CollabError, { collabErrorIndicatorAtom } from "./collab/CollabError";
@@ -506,6 +511,30 @@ const ExcalidrawWrapper = () => {
     };
 
     initializeScene({ collabAPI, excalidrawAPI }).then(async (data) => {
+      // On a local (non-external) scene, try to restore the last active IDB scene
+      if (!data.isExternalScene) {
+        try {
+          const lastActiveId = await ScenesIndexedDBAdapter.getLastActiveId();
+          if (lastActiveId) {
+            const savedScene = await ScenesIndexedDBAdapter.get(lastActiveId);
+            if (savedScene) {
+              activeSceneIdRef.current = lastActiveId;
+              const idbScene = {
+                elements: restoreElements(savedScene.elements, null, {
+                  repairBindings: true,
+                  deleteInvisibleElements: true,
+                }),
+                appState: restoreAppState(savedScene.appState, null),
+                files: savedScene.files,
+              };
+              initialStatePromiseRef.current.promise.resolve(idbScene);
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn("Failed to load last IDB scene", err);
+        }
+      }
       loadImages(data, /* isInitialLoad */ true);
       initialStatePromiseRef.current.promise.resolve(data.scene);
     });
@@ -655,6 +684,35 @@ const ExcalidrawWrapper = () => {
     };
   }, [excalidrawAPI]);
 
+  const saveToIDB = useRef(
+    debounce(
+      async (
+        elements: readonly OrderedExcalidrawElement[],
+        appState: AppState,
+        files: BinaryFiles,
+        sceneId: string,
+      ) => {
+        try {
+          const existing = await ScenesIndexedDBAdapter.get(sceneId);
+          if (!existing) {
+            return;
+          }
+          const updated: SavedScene = {
+            ...existing,
+            elements,
+            appState: clearAppStateForLocalStorage(appState),
+            files,
+            modified: Date.now(),
+          };
+          await ScenesIndexedDBAdapter.save(updated);
+        } catch (err) {
+          console.warn("IDB auto-save failed", err);
+        }
+      },
+      SAVE_TO_LOCAL_STORAGE_TIMEOUT,
+    ),
+  ).current;
+
   const onChange = (
     elements: readonly OrderedExcalidrawElement[],
     appState: AppState,
@@ -667,6 +725,9 @@ const ExcalidrawWrapper = () => {
     // this check is redundant, but since this is a hot path, it's best
     // not to evaludate the nested expression every time
     if (!LocalData.isSavePaused()) {
+      if (activeSceneIdRef.current) {
+        saveToIDB(elements, appState, files, activeSceneIdRef.current);
+      }
       LocalData.save(elements, appState, files, () => {
         if (excalidrawAPI) {
           let didChange = false;
@@ -709,6 +770,29 @@ const ExcalidrawWrapper = () => {
 
   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
     null,
+  );
+
+  const [showLocalFilesDialog, setShowLocalFilesDialog] = useState(false);
+  const activeSceneIdRef = useRef<string | null>(null);
+
+  const handleLoadSavedScene = useCallback(
+    (scene: SavedScene) => {
+      if (!excalidrawAPI) {
+        return;
+      }
+      excalidrawAPI.updateScene({
+        elements: restoreElements(scene.elements, null, {
+          repairBindings: true,
+          deleteInvisibleElements: true,
+        }),
+        appState: restoreAppState(scene.appState, null),
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+      if (Object.keys(scene.files).length > 0) {
+        excalidrawAPI.addFiles(Object.values(scene.files));
+      }
+    },
+    [excalidrawAPI],
   );
 
   const onExportToBackend = async (
@@ -920,6 +1004,7 @@ const ExcalidrawWrapper = () => {
           theme={appTheme}
           setTheme={(theme) => setAppTheme(theme)}
           refresh={() => forceRefresh((prev) => !prev)}
+          onLocalFilesOpen={() => setShowLocalFilesDialog(true)}
         />
         <AppWelcomeScreen
           onCollabDialogOpen={onCollabDialogOpen}
@@ -993,6 +1078,18 @@ const ExcalidrawWrapper = () => {
           <ErrorDialog onClose={() => setErrorMessage("")}>
             {errorMessage}
           </ErrorDialog>
+        )}
+
+        {showLocalFilesDialog && excalidrawAPI && (
+          <LocalFilesDialog
+            excalidrawAPI={excalidrawAPI}
+            activeSceneId={activeSceneIdRef.current}
+            onSceneActivated={(id) => {
+              activeSceneIdRef.current = id;
+            }}
+            onOpenScene={handleLoadSavedScene}
+            onClose={() => setShowLocalFilesDialog(false)}
+          />
         )}
 
         <CommandPalette

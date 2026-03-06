@@ -224,6 +224,65 @@ export class LocalData {
     },
   });
 }
+export interface SavedScene {
+  id: string;
+  name: string;
+  elements: readonly ExcalidrawElement[];
+  appState: Partial<AppState>;
+  files: BinaryFiles;
+  created: number;
+  modified: number;
+  thumbnail?: string;
+}
+
+const SCENES_LAST_ACTIVE_KEY = "__meta__lastActiveId";
+
+export class ScenesIndexedDBAdapter {
+  private static store = createStore(
+    "excalidraw-scenes-db",
+    "excalidraw-scenes-store",
+  );
+
+  static async list(): Promise<SavedScene[]> {
+    const allEntries = await entries<string, SavedScene>(
+      ScenesIndexedDBAdapter.store,
+    );
+    return allEntries
+      .filter(([key]) => key !== SCENES_LAST_ACTIVE_KEY)
+      .map(([, scene]) => scene)
+      .sort((a, b) => b.modified - a.modified);
+  }
+
+  static async get(id: string): Promise<SavedScene | null> {
+    return (await get<SavedScene>(id, ScenesIndexedDBAdapter.store)) ?? null;
+  }
+
+  static async save(scene: SavedScene): Promise<void> {
+    await set(scene.id, scene, ScenesIndexedDBAdapter.store);
+  }
+
+  static async delete(id: string): Promise<void> {
+    await del(id, ScenesIndexedDBAdapter.store);
+  }
+
+  static async getLastActiveId(): Promise<string | null> {
+    return (
+      (await get<string>(
+        SCENES_LAST_ACTIVE_KEY,
+        ScenesIndexedDBAdapter.store,
+      )) ?? null
+    );
+  }
+
+  static async setLastActiveId(id: string): Promise<void> {
+    await set(SCENES_LAST_ACTIVE_KEY, id, ScenesIndexedDBAdapter.store);
+  }
+
+  static async clearLastActiveId(): Promise<void> {
+    await del(SCENES_LAST_ACTIVE_KEY, ScenesIndexedDBAdapter.store);
+  }
+}
+
 export class LibraryIndexedDBAdapter {
   /** IndexedDB database and store name */
   private static idb_name = STORAGE_KEYS.IDB_LIBRARY;
